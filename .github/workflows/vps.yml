@@ -4,13 +4,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  openvpn-tailscale:
+  setup-vpn:
     runs-on: ubuntu-latest
     env:
       OPENVPN_PORT: 1194
-      TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
-      EASYRSA_BATCH: 1
-      EASYRSA_REQ_CN: "github-runner"
+      TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}  # Set this in GitHub Secrets
 
     steps:
       - name: Checkout repo
@@ -19,74 +17,85 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y openvpn easy-rsa curl jq ufw openssh-server snapd
-          sudo snap install tailscale
+          sudo apt-get install -y openvpn easy-rsa curl jq
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Setup OpenVPN PKI
+        run: |
+          mkdir -p ~/openvpn-ca
+          cd ~/openvpn-ca
+
+          # Initialize Easy-RSA if missing
+          if [ ! -f ./easyrsa ]; then
+              make-cadir .
+          fi
+
+          # Initialize PKI if missing
+          if [ ! -d ./pki ]; then
+              ./easyrsa init-pki
+          fi
+
+          # Build CA if missing
+          if [ ! -f ./pki/ca.crt ]; then
+              export EASYRSA_BATCH=1
+              export EASYRSA_REQ_CN="github-runner"
+              ./easyrsa build-ca nopass
+          fi
+
+          # Generate server certificate if missing
+          if [ ! -f ./pki/issued/server.crt ]; then
+              ./easyrsa gen-req server nopass
+              ./easyrsa sign-req server server
+          fi
+
+          # Generate client certificate if missing
+          if [ ! -f ./pki/issued/client1.crt ]; then
+              ./easyrsa gen-req client1 nopass
+              ./easyrsa sign-req client client1
+          fi
+
+          # Generate DH parameters if missing
+          if [ ! -f ./pki/dh.pem ]; then
+              ./easyrsa gen-dh
+          fi
+
+      - name: Start OpenVPN server
+        run: |
+          sudo openvpn --genkey --secret ~/openvpn-ca/ta.key
+          sudo tee /etc/openvpn/server.conf > /dev/null <<EOF
+          port $OPENVPN_PORT
+          proto tcp
+          dev tun
+          ca ~/openvpn-ca/pki/ca.crt
+          cert ~/openvpn-ca/pki/issued/server.crt
+          key ~/openvpn-ca/pki/private/server.key
+          dh ~/openvpn-ca/pki/dh.pem
+          server 10.8.0.0 255.255.255.0
+          persist-key
+          persist-tun
+          keepalive 10 120
+          cipher AES-256-CBC
+          user nobody
+          group nogroup
+          status /var/log/openvpn-status.log
+          verb 3
+          EOF
+          sudo systemctl start openvpn@server || sudo openvpn --config /etc/openvpn/server.conf --daemon
 
       - name: Connect Tailscale
         run: |
           sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
 
-      - name: Prepare OpenVPN PKI
+      - name: Get Tailscale IP
         run: |
-          mkdir -p ~/openvpn-ca
-          cd ~/openvpn-ca
+          tailscale ip -4 > ts_ip.txt
+          cat ts_ip.txt
+        id: get_ip
 
-          # Only initialize easyrsa if missing
-          if [ ! -f ./easyrsa ]; then
-              make-cadir .
-          fi
-
-          cd ~/openvpn-ca
-
-          # Initialize PKI if missing
-          [ ! -d ./pki ] && ./easyrsa init-pki
-
-          # Build CA if missing
-          [ ! -f ./pki/ca.crt ] && ./easyrsa build-ca nopass
-
-          # Generate server certificate if missing
-          [ ! -f ./pki/issued/server.crt ] && ./easyrsa gen-req server nopass
-          [ ! -f ./pki/issued/server.crt ] && ./easyrsa sign-req server server
-
-          # Generate client certificate if missing
-          [ ! -f ./pki/issued/client1.crt ] && ./easyrsa gen-req client1 nopass
-          [ ! -f ./pki/issued/client1.crt ] && ./easyrsa sign-req client client1
-
-          # Generate Diffie-Hellman parameters if missing
-          [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
-
-      - name: Configure OpenVPN server
-        run: |
-          sudo cp ~/openvpn-ca/pki/ca.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/issued/server.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/private/server.key /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/dh.pem /etc/openvpn/
-
-          # Create minimal server.conf
-          sudo tee /etc/openvpn/server.conf > /dev/null <<EOF
-          port $OPENVPN_PORT
-          proto tcp
-          dev tun
-          ca ca.crt
-          cert server.crt
-          key server.key
-          dh dh.pem
-          server 10.8.0.0 255.255.255.0
-          keepalive 10 120
-          persist-key
-          persist-tun
-          status openvpn-status.log
-          verb 3
-          EOF
-
-      - name: Start OpenVPN server
-        run: |
-          sudo systemctl enable openvpn@server
-          sudo systemctl start openvpn@server
-          sleep 5
-          sudo systemctl status openvpn@server
-
-      - name: Generate client.ovpn
+      - name: Upload client.ovpn
         run: |
           HOST=$(tailscale ip -4)
           PORT=$OPENVPN_PORT
@@ -113,7 +122,7 @@ jobs:
           </key>
           EOF
 
-      - name: Upload client.ovpn
+      - name: Upload client.ovpn artifact
         uses: actions/upload-artifact@v4
         with:
           name: client-ovpn
