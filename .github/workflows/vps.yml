@@ -1,79 +1,112 @@
-name: FreeVPS-OpenVPN
+name: OpenVPN Server
 
 on:
-  workflow_dispatch:   # manual start
-  schedule:
-    - cron: "0 */6 * * *"   # respawn every 6 hours
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - name: Update & Install
-        run: |
-          sudo apt update && sudo apt upgrade -y
-          sudo apt install openvpn easy-rsa -y
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt update && sudo apt install ngrok -y
 
-      - name: Configure EasyRSA + Server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn easy-rsa wget unzip
+
+      - name: Setup EasyRSA PKI
         run: |
           make-cadir ~/openvpn-ca
           cd ~/openvpn-ca
           ./easyrsa init-pki
-          echo -ne '\n' | ./easyrsa build-ca nopass
-          ./easyrsa gen-req server nopass
-          echo "yes" | ./easyrsa sign-req server server
+          ./easyrsa --batch build-ca nopass
           ./easyrsa gen-dh
-          openvpn --genkey --secret ta.key
-          ./easyrsa gen-req client1 nopass
-          echo "yes" | ./easyrsa sign-req client client1
+          ./easyrsa --batch gen-req server nopass
+          ./easyrsa --batch sign-req server server
+          ./easyrsa --batch gen-req client1 nopass
+          ./easyrsa --batch sign-req client client1
 
-          # server config
-          sudo gunzip -c /usr/share/doc/openvpn/examples/sample-config-files/server.conf.gz > server.conf
-          sudo mv server.conf /etc/openvpn/server.conf
-          sudo sed -i 's/;user nobody/user nobody/' /etc/openvpn/server.conf
-          sudo sed -i 's/;group nogroup/group nogroup/' /etc/openvpn/server.conf
-
-      - name: Start OpenVPN Server
+      - name: Configure OpenVPN Server
         run: |
-          sudo systemctl start openvpn@server
-          sudo systemctl enable openvpn@server
+          sudo mkdir -p /etc/openvpn
+          sudo cp ~/openvpn-ca/pki/ca.crt /etc/openvpn/
+          sudo cp ~/openvpn-ca/pki/private/server.key /etc/openvpn/
+          sudo cp ~/openvpn-ca/pki/issued/server.crt /etc/openvpn/
+          sudo cp ~/openvpn-ca/pki/dh.pem /etc/openvpn/
+          cat <<EOF | sudo tee /etc/openvpn/server.conf
+          port 1194
+          proto tcp
+          dev tun
+          ca ca.crt
+          cert server.crt
+          key server.key
+          dh dh.pem
+          keepalive 10 120
+          persist-key
+          persist-tun
+          status openvpn-status.log
+          verb 3
+          EOF
 
-      - name: Expose OpenVPN via Ngrok
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTH }}
+      - name: Start OpenVPN
         run: |
-          ngrok config add-authtoken $NGROK_AUTHTOKEN
-          nohup ngrok tcp 1194 &
+          sudo openvpn --config /etc/openvpn/server.conf --daemon
+          sleep 5
+
+      - name: Install ngrok
+        run: |
+          wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
+          unzip ngrok-stable-linux-amd64.zip
+          sudo mv ngrok /usr/local/bin
+
+      - name: Authenticate ngrok
+        run: |
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Start ngrok tunnel
+        run: |
+          nohup ngrok tcp 1194 > ngrok.log &
           sleep 10
-          curl --silent --show-error http://127.0.0.1:4040/api/tunnels > tunnel.json
-          cat tunnel.json
+          cat ngrok.log
 
-      - name: Build Client Config
+      - name: Get ngrok public address
         run: |
-          mkdir -p ~/ovpn
-          HOST=$(jq -r '.tunnels[0].public_url' tunnel.json | sed 's/tcp:\/\///')
-          PORT=$(echo $HOST | cut -d':' -f2)
-          ADDR=$(echo $HOST | cut -d':' -f1)
+          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' > ngrok_url.txt
+          cat ngrok_url.txt
 
-          echo "client
+      - name: Generate Client OVPN Profile
+        run: |
+          NGROK_ADDR=$(cat ngrok_url.txt | sed 's/tcp:\/\///')
+          HOST=$(echo $NGROK_ADDR | cut -d: -f1)
+          PORT=$(echo $NGROK_ADDR | cut -d: -f2)
+
+          cat <<EOF > client.ovpn
+          client
           dev tun
           proto tcp
-          remote $ADDR $PORT
+          remote $HOST $PORT
           resolv-retry infinite
           nobind
           persist-key
           persist-tun
           remote-cert-tls server
           cipher AES-256-CBC
-          auth SHA256
-          comp-lzo
-          verb 3" > ~/ovpn/client.ovpn
+          verb 3
+          <ca>
+          $(cat ~/openvpn-ca/pki/ca.crt)
+          </ca>
+          <cert>
+          $(cat ~/openvpn-ca/pki/issued/client1.crt)
+          </cert>
+          <key>
+          $(cat ~/openvpn-ca/pki/private/client1.key)
+          </key>
+          EOF
 
-      - name: Upload client config
-        uses: actions/upload-artifact@v4
+      - name: Upload OVPN Config
+        uses: actions/upload-artifact@v3
         with:
           name: client-ovpn
-          path: ~/ovpn/client.ovpn
+          path: client.ovpn
