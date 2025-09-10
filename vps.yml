@@ -1,0 +1,79 @@
+name: FreeVPS-OpenVPN
+
+on:
+  workflow_dispatch:   # manual start
+  schedule:
+    - cron: "0 */6 * * *"   # respawn every 6 hours
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update & Install
+        run: |
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install openvpn easy-rsa -y
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install ngrok -y
+
+      - name: Configure EasyRSA + Server
+        run: |
+          make-cadir ~/openvpn-ca
+          cd ~/openvpn-ca
+          ./easyrsa init-pki
+          echo -ne '\n' | ./easyrsa build-ca nopass
+          ./easyrsa gen-req server nopass
+          echo "yes" | ./easyrsa sign-req server server
+          ./easyrsa gen-dh
+          openvpn --genkey --secret ta.key
+          ./easyrsa gen-req client1 nopass
+          echo "yes" | ./easyrsa sign-req client client1
+
+          # server config
+          sudo gunzip -c /usr/share/doc/openvpn/examples/sample-config-files/server.conf.gz > server.conf
+          sudo mv server.conf /etc/openvpn/server.conf
+          sudo sed -i 's/;user nobody/user nobody/' /etc/openvpn/server.conf
+          sudo sed -i 's/;group nogroup/group nogroup/' /etc/openvpn/server.conf
+
+      - name: Start OpenVPN Server
+        run: |
+          sudo systemctl start openvpn@server
+          sudo systemctl enable openvpn@server
+
+      - name: Expose OpenVPN via Ngrok
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTH }}
+        run: |
+          ngrok config add-authtoken $NGROK_AUTHTOKEN
+          nohup ngrok tcp 1194 &
+          sleep 10
+          curl --silent --show-error http://127.0.0.1:4040/api/tunnels > tunnel.json
+          cat tunnel.json
+
+      - name: Build Client Config
+        run: |
+          mkdir -p ~/ovpn
+          HOST=$(jq -r '.tunnels[0].public_url' tunnel.json | sed 's/tcp:\/\///')
+          PORT=$(echo $HOST | cut -d':' -f2)
+          ADDR=$(echo $HOST | cut -d':' -f1)
+
+          echo "client
+          dev tun
+          proto tcp
+          remote $ADDR $PORT
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          cipher AES-256-CBC
+          auth SHA256
+          comp-lzo
+          verb 3" > ~/ovpn/client.ovpn
+
+      - name: Upload client config
+        uses: actions/upload-artifact@v3
+        with:
+          name: client-ovpn
+          path: ~/ovpn/client.ovpn
