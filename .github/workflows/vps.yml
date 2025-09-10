@@ -1,92 +1,86 @@
-name: OpenVPN Server
+name: Auto Tailscale OpenVPN
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"  # runs every 6 hours to re-init the VPN automatically
 
 jobs:
-  build:
+  vpn:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
 
-      - name: Install dependencies
+      # 1️⃣ Update system and install dependencies
+      - name: Update & Install Packages
         run: |
-          sudo apt-get update
-          sudo apt-get install -y openvpn easy-rsa wget unzip jq
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install openvpn easy-rsa iproute2 curl jq -y
 
-      - name: Setup EasyRSA PKI
+      # 2️⃣ Install Tailscale
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      # 3️⃣ Connect Tailscale with auth key
+      - name: Connect Tailscale
+        env:
+          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
         run: |
-          make-cadir ~/openvpn-ca
+          sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
+
+      # 4️⃣ Setup OpenVPN PKI
+      - name: Setup OpenVPN PKI
+        run: |
+          mkdir -p ~/openvpn-ca
           cd ~/openvpn-ca
-          ./easyrsa init-pki
-          ./easyrsa --batch build-ca nopass
-          ./easyrsa gen-dh
-          ./easyrsa --batch gen-req server nopass
-          ./easyrsa --batch sign-req server server
-          ./easyrsa --batch gen-req client1 nopass
-          ./easyrsa --batch sign-req client client1
+          if [ ! -d pki ]; then
+            ./easyrsa init-pki
+            echo | ./easyrsa build-ca nopass
+            ./easyrsa gen-req server nopass
+            ./easyrsa sign-req server server
+            ./easyrsa gen-dh
+            openvpn --genkey --secret ta.key
+            ./easyrsa gen-req client1 nopass
+            ./easyrsa sign-req client client1
+          fi
 
-      - name: Configure OpenVPN Server
+      # 5️⃣ Configure OpenVPN server
+      - name: Configure OpenVPN
         run: |
-          sudo mkdir -p /etc/openvpn
-          sudo cp ~/openvpn-ca/pki/ca.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/private/server.key /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/issued/server.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/dh.pem /etc/openvpn/
-          cat <<EOF | sudo tee /etc/openvpn/server.conf
+          sudo bash -c 'cat > /etc/openvpn/server.conf <<EOF
           port 1194
-          proto tcp
+          proto udp
           dev tun
-          ca ca.crt
-          cert server.crt
-          key server.key
-          dh dh.pem
+          ca ~/openvpn-ca/pki/ca.crt
+          cert ~/openvpn-ca/pki/issued/server.crt
+          key ~/openvpn-ca/pki/private/server.key
+          dh ~/openvpn-ca/pki/dh.pem
+          server 10.8.0.0 255.255.255.0
+          ifconfig-pool-persist ipp.txt
           keepalive 10 120
+          cipher AES-256-CBC
           persist-key
           persist-tun
           status openvpn-status.log
           verb 3
-          EOF
+          tls-auth ~/openvpn-ca/ta.key 0
+          EOF'
 
+      # 6️⃣ Start OpenVPN in background with retry
       - name: Start OpenVPN
         run: |
-          nohup sudo openvpn --config /etc/openvpn/server.conf > openvpn.log 2>&1 &
-          sleep 10
-          tail -n 20 openvpn.log
+          sudo pkill openvpn || true
+          nohup sudo openvpn --config /etc/openvpn/server.conf & sleep 5
 
-      - name: Install ngrok
+      # 7️⃣ Generate client config dynamically using Tailscale IP
+      - name: Generate client.ovpn
         run: |
-          wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
-          unzip ngrok-stable-linux-amd64.zip
-          sudo mv ngrok /usr/local/bin
-
-      - name: Authenticate ngrok
-        run: |
-          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-
-      - name: Start ngrok tunnel
-        run: |
-          nohup ngrok tcp 1194 > ngrok.log &
-          sleep 10
-          cat ngrok.log
-
-      - name: Get ngrok public address
-        run: |
-          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' > ngrok_url.txt
-          cat ngrok_url.txt
-
-      - name: Generate Client OVPN Profile
-        run: |
-          NGROK_ADDR=$(cat ngrok_url.txt | sed 's/tcp:\/\///')
-          HOST=$(echo $NGROK_ADDR | cut -d: -f1)
-          PORT=$(echo $NGROK_ADDR | cut -d: -f2)
-
-          cat <<EOF > client.ovpn
+          HOST=$(tailscale ip -4)
+          PORT=1194
+          mkdir -p ~/client-config
+          cat <<EOF > ~/client-config/client.ovpn
           client
           dev tun
-          proto tcp
+          proto udp
           remote $HOST $PORT
           resolv-retry infinite
           nobind
@@ -106,8 +100,10 @@ jobs:
           </key>
           EOF
 
-      - name: Upload OVPN Config
+      # 8️⃣ Upload client.ovpn as artifact for download
+      - name: Upload client.ovpn
         uses: actions/upload-artifact@v4
         with:
           name: client-ovpn
-          path: client.ovpn
+          path: ~/client-config/client.ovpn
+          if-no-files-found: warn
