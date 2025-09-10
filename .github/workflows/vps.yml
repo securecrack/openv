@@ -52,8 +52,9 @@ jobs:
 
       - name: Start OpenVPN
         run: |
-          sudo openvpn --config /etc/openvpn/server.conf --daemon
-          sleep 5
+          nohup sudo openvpn --config /etc/openvpn/server.conf > openvpn.log 2>&1 &
+          sleep 10
+          tail -n 20 openvpn.log
 
       - name: Install ngrok
         run: |
