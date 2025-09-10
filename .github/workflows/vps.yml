@@ -1,88 +1,81 @@
-name: OpenVPN-Tailscale
+name: FreeVPS-OpenVPN-Tailscale
 
 on:
-  workflow_dispatch:
-    # allows manual start
+  workflow_dispatch:   # Manual start
+  schedule:
+    - cron: "0 */6 * * *"   # Every 6 hours
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      OPENVPN_PORT: 1194
+      TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
+      TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Update & Install Packages
+      - name: Update & Install Dependencies
         run: |
           sudo apt update && sudo apt upgrade -y
-          sudo apt install openvpn easy-rsa curl jq tailscale -y
+          sudo apt install openvpn easy-rsa curl jq gnupg lsb-release -y
+          
+          # Install Tailscale via official repository
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt update
+          sudo apt install tailscale -y
 
-      - name: Setup Easy-RSA
+      - name: Setup Easy-RSA & Generate CA
         run: |
           make-cadir ~/openvpn-ca
           cd ~/openvpn-ca
           ./easyrsa init-pki
-          echo "Easy-RSA PKI initialized"
-
-      - name: Create CA & Server Certificates
-        run: |
-          cd ~/openvpn-ca
-          ./easyrsa build-ca nopass <<< $'\n'
-          ./easyrsa gen-req server nopass <<< $'\n'
-          ./easyrsa sign-req server server <<< "yes"
+          echo -en "\n" | ./easyrsa build-ca nopass
+          ./easyrsa gen-req server nopass
+          ./easyrsa sign-req server server
+          ./easyrsa gen-req client1 nopass
+          ./easyrsa sign-req client client1
           ./easyrsa gen-dh
           openvpn --genkey --secret ta.key
-          echo "Certificates created"
-
+          
       - name: Configure OpenVPN Server
         run: |
-          sudo cp ~/openvpn-ca/pki/ca.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/issued/server.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/private/server.key /etc/openvpn/
-          sudo cp ~/openvpn-ca/ta.key /etc/openvpn/
-          cat <<EOF | sudo tee /etc/openvpn/server.conf
-          port 1194
+          sudo bash -c "cat > /etc/openvpn/server.conf <<EOF
+          port ${OPENVPN_PORT}
           proto tcp
           dev tun
-          ca ca.crt
-          cert server.crt
-          key server.key
-          dh dh.pem
-          tls-auth ta.key 0
+          ca ~/openvpn-ca/pki/ca.crt
+          cert ~/openvpn-ca/pki/issued/server.crt
+          key ~/openvpn-ca/pki/private/server.key
+          dh ~/openvpn-ca/pki/dh.pem
           server 10.8.0.0 255.255.255.0
+          ifconfig-pool-persist ipp.txt
           keepalive 10 120
+          cipher AES-256-CBC
           persist-key
           persist-tun
-          cipher AES-256-CBC
-          user nobody
-          group nogroup
           status openvpn-status.log
           verb 3
-          EOF
+          tls-auth ~/openvpn-ca/ta.key 0
+          EOF"
 
       - name: Start OpenVPN Server
-        run: sudo systemctl start openvpn@server || sudo openvpn --config /etc/openvpn/server.conf --daemon
+        run: sudo openvpn --config /etc/openvpn/server.conf --daemon
 
       - name: Connect to Tailscale
-        env:
-          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
         run: |
-          sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
+          sudo tailscaled &
+          sleep 5
+          sudo tailscale up --authkey ${TS_CLIENT_SECRET} --hostname github-runner --accept-routes --accept-dns
 
-      - name: Get Tailscale IP
-        id: tailscale_ip
+      - name: Generate Client Config
         run: |
-          TS_IP=$(tailscale ip -4)
-          echo "TS_IP=$TS_IP" >> $GITHUB_OUTPUT
-
-      - name: Generate client.ovpn
-        run: |
-          TS_IP=${{ steps.tailscale_ip.outputs.TS_IP }}
+          CLIENT_IP="10.8.0.2"
           cat <<EOF > client.ovpn
           client
           dev tun
           proto tcp
-          remote $TS_IP 1194
+          remote ${CLIENT_IP} ${OPENVPN_PORT}
           resolv-retry infinite
           nobind
           persist-key
@@ -101,7 +94,7 @@ jobs:
           </key>
           EOF
 
-      - name: Upload client.ovpn artifact
+      - name: Upload OpenVPN Client Config
         uses: actions/upload-artifact@v4
         with:
           name: client-ovpn
