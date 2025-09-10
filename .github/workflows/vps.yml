@@ -1,53 +1,53 @@
 name: FreeVPS-OpenVPN-Tailscale
 
 on:
-  workflow_dispatch:   # Manual start
+  workflow_dispatch:   # allows manual start
   schedule:
-    - cron: "0 */6 * * *"   # Every 6 hours
+    - cron: "0 */6 * * *"   # runs every 6 hours automatically
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
       OPENVPN_PORT: 1194
-      TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
-      TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
-
+      TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
     steps:
       - name: Update & Install Dependencies
         run: |
           sudo apt update && sudo apt upgrade -y
-          sudo apt install openvpn easy-rsa curl jq gnupg lsb-release -y
-          
-          # Install Tailscale via official repository
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt update
-          sudo apt install tailscale -y
+          sudo apt install -y openvpn easy-rsa jq curl ufw
 
-      - name: Setup Easy-RSA & Generate CA
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Start Tailscale
+        run: |
+          sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
+
+      - name: Setup Easy-RSA
         run: |
           make-cadir ~/openvpn-ca
           cd ~/openvpn-ca
           ./easyrsa init-pki
-          echo -en "\n" | ./easyrsa build-ca nopass
+          echo -e "\n" | ./easyrsa build-ca nopass
           ./easyrsa gen-req server nopass
           ./easyrsa sign-req server server
-          ./easyrsa gen-req client1 nopass
-          ./easyrsa sign-req client client1
           ./easyrsa gen-dh
           openvpn --genkey --secret ta.key
-          
-      - name: Configure OpenVPN Server
+          ./easyrsa gen-req client1 nopass
+          ./easyrsa sign-req client client1
+
+      - name: Create OpenVPN Server Config
         run: |
-          sudo bash -c "cat > /etc/openvpn/server.conf <<EOF
-          port ${OPENVPN_PORT}
+          sudo bash -c 'cat > /etc/openvpn/server.conf <<EOF
+          port $OPENVPN_PORT
           proto tcp
           dev tun
-          ca ~/openvpn-ca/pki/ca.crt
-          cert ~/openvpn-ca/pki/issued/server.crt
-          key ~/openvpn-ca/pki/private/server.key
-          dh ~/openvpn-ca/pki/dh.pem
+          ca /home/runner/openvpn-ca/pki/ca.crt
+          cert /home/runner/openvpn-ca/pki/issued/server.crt
+          key /home/runner/openvpn-ca/pki/private/server.key
+          dh /home/runner/openvpn-ca/pki/dh.pem
           server 10.8.0.0 255.255.255.0
           ifconfig-pool-persist ipp.txt
           keepalive 10 120
@@ -56,26 +56,20 @@ jobs:
           persist-tun
           status openvpn-status.log
           verb 3
-          tls-auth ~/openvpn-ca/ta.key 0
-          EOF"
+          EOF'
 
       - name: Start OpenVPN Server
-        run: sudo openvpn --config /etc/openvpn/server.conf --daemon
-
-      - name: Connect to Tailscale
         run: |
-          sudo tailscaled &
+          sudo openvpn --config /etc/openvpn/server.conf --daemon
           sleep 5
-          sudo tailscale up --authkey ${TS_CLIENT_SECRET} --hostname github-runner --accept-routes --accept-dns
 
       - name: Generate Client Config
         run: |
-          CLIENT_IP="10.8.0.2"
           cat <<EOF > client.ovpn
           client
           dev tun
           proto tcp
-          remote ${CLIENT_IP} ${OPENVPN_PORT}
+          remote $(tailscale ip -4) $OPENVPN_PORT
           resolv-retry infinite
           nobind
           persist-key
@@ -94,7 +88,7 @@ jobs:
           </key>
           EOF
 
-      - name: Upload OpenVPN Client Config
+      - name: Upload Client Config
         uses: actions/upload-artifact@v4
         with:
           name: client-ovpn
