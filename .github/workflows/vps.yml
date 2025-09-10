@@ -1,64 +1,43 @@
-name: Persistent Tailscale + OpenVPN Setup
+name: Temporary OpenVPN Server
 
 on:
   workflow_dispatch:
 
 jobs:
-  setup-vpn:
-    # Must run on your self-hosted runner
-    runs-on: self-hosted
+  temp-openvpn:
+    runs-on: ubuntu-latest
     env:
       OPENVPN_PORT: 1194
-      TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y openvpn easy-rsa ufw curl jq
-
-      - name: Install Tailscale
-        run: |
-          if ! command -v tailscale &> /dev/null; then
-            curl -fsSL https://tailscale.com/install.sh | sh
-          fi
-          sudo systemctl enable --now tailscaled
-
-      - name: Connect Tailscale and Advertise Exit Node
-        run: |
-          sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --advertise-exit-node --accept-routes
-          tailscale status
-          tailscale ip -4
-
-      - name: Configure Firewall
-        run: |
-          sudo ufw allow ${OPENVPN_PORT}/tcp
-          sudo ufw enable || true
+          sudo apt-get install -y openvpn easy-rsa ufw
 
       - name: Setup Easy-RSA for OpenVPN
         run: |
           mkdir -p ~/openvpn-ca
           cd ~/openvpn-ca
-          if [ ! -d ./easy-rsa ]; then
-            make-cadir ./easy-rsa
-          fi
+          make-cadir easy-rsa
           cd easy-rsa
-          [ ! -d ./pki ] && ./easyrsa init-pki
-          [ ! -f ./pki/ca.crt ] && (export EASYRSA_BATCH=1; export EASYRSA_REQ_CN="github-runner"; ./easyrsa build-ca nopass)
-          [ ! -f ./pki/issued/server.crt ] && ./easyrsa gen-req server nopass
-          [ ! -f ./pki/issued/server.crt ] && ./easyrsa sign-req server server
-          [ ! -f ./pki/issued/client1.crt ] && ./easyrsa gen-req client1 nopass
-          [ ! -f ./pki/issued/client1.crt ] && ./easyrsa sign-req client client1
-          [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
+          ./easyrsa init-pki
+          export EASYRSA_BATCH=1
+          ./easyrsa build-ca nopass
+          ./easyrsa gen-req server nopass
+          ./easyrsa sign-req server server
+          ./easyrsa gen-req client1 nopass
+          ./easyrsa sign-req client client1
+          ./easyrsa gen-dh
 
       - name: Generate OpenVPN Server Config
         run: |
           OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
           cd $OPENVPN_DIR
-          SERVER_IP=$(tailscale ip -4)
+          SERVER_IP=$(curl -s https://api.ipify.org)
           cat > server.conf <<EOF
 port ${OPENVPN_PORT}
 proto tcp
@@ -79,16 +58,17 @@ status openvpn-status.log
 verb 3
 EOF
 
-      - name: Enable OpenVPN Service
+      - name: Start OpenVPN in Background
         run: |
-          sudo cp $HOME/openvpn-ca/easy-rsa/server.conf /etc/openvpn/server.conf
-          sudo systemctl enable --now openvpn@server
+          sudo openvpn --config $HOME/openvpn-ca/easy-rsa/server.conf --daemon
+          sleep 5
+          ps aux | grep openvpn
 
-      - name: Generate OpenVPN Client Config
+      - name: Generate Client Config
         run: |
           OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
           cd $OPENVPN_DIR
-          SERVER_IP=$(tailscale ip -4)
+          SERVER_IP=$(curl -s https://api.ipify.org)
           cat > client.ovpn <<EOF
 client
 dev tun
