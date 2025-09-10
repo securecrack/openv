@@ -4,126 +4,89 @@ on:
   workflow_dispatch:
 
 jobs:
-  setup-vpn:
+  setup-openvpn:
     runs-on: ubuntu-latest
     env:
       OPENVPN_PORT: 1194
-      TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}  # Set this in GitHub Secrets
+      TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    - name: Checkout repo
+      uses: actions/checkout@v3
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openvpn easy-rsa curl jq
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openvpn easy-rsa ufw curl jq
 
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+    - name: Install Tailscale
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Setup OpenVPN PKI
-        run: |
-          mkdir -p ~/openvpn-ca
-          cd ~/openvpn-ca
+    - name: Connect Tailscale
+      run: |
+        sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
 
-          # Initialize Easy-RSA if missing
-          if [ ! -f ./easyrsa ]; then
-              make-cadir .
-          fi
+    - name: Setup Easy-RSA
+      run: |
+        mkdir -p ~/openvpn-ca
+        cd ~/openvpn-ca
 
-          # Initialize PKI if missing
-          if [ ! -d ./pki ]; then
-              ./easyrsa init-pki
-          fi
+        # Initialize Easy-RSA if missing
+        if [ ! -d ./easy-rsa ]; then
+            make-cadir ./easy-rsa
+        fi
 
-          # Build CA if missing
-          if [ ! -f ./pki/ca.crt ]; then
-              export EASYRSA_BATCH=1
-              export EASYRSA_REQ_CN="github-runner"
-              ./easyrsa build-ca nopass
-          fi
+        cd easy-rsa
 
-          # Generate server certificate if missing
-          if [ ! -f ./pki/issued/server.crt ]; then
-              ./easyrsa gen-req server nopass
-              ./easyrsa sign-req server server
-          fi
+        # Initialize PKI if missing
+        [ ! -d ./pki ] && ./easyrsa init-pki
 
-          # Generate client certificate if missing
-          if [ ! -f ./pki/issued/client1.crt ]; then
-              ./easyrsa gen-req client1 nopass
-              ./easyrsa sign-req client client1
-          fi
+        # Build CA if missing
+        [ ! -f ./pki/ca.crt ] && (export EASYRSA_BATCH=1; export EASYRSA_REQ_CN="github-runner"; ./easyrsa build-ca nopass)
 
-          # Generate DH parameters if missing
-          if [ ! -f ./pki/dh.pem ]; then
-              ./easyrsa gen-dh
-          fi
+        # Generate server certificate if missing
+        [ ! -f ./pki/issued/server.crt ] && ./easyrsa gen-req server nopass
+        [ ! -f ./pki/issued/server.crt ] && ./easyrsa sign-req server server
 
-      - name: Start OpenVPN server
-        run: |
-          sudo openvpn --genkey --secret ~/openvpn-ca/ta.key
-          sudo tee /etc/openvpn/server.conf > /dev/null <<EOF
-          port $OPENVPN_PORT
-          proto tcp
-          dev tun
-          ca ~/openvpn-ca/pki/ca.crt
-          cert ~/openvpn-ca/pki/issued/server.crt
-          key ~/openvpn-ca/pki/private/server.key
-          dh ~/openvpn-ca/pki/dh.pem
-          server 10.8.0.0 255.255.255.0
-          persist-key
-          persist-tun
-          keepalive 10 120
-          cipher AES-256-CBC
-          user nobody
-          group nogroup
-          status /var/log/openvpn-status.log
-          verb 3
-          EOF
-          sudo systemctl start openvpn@server || sudo openvpn --config /etc/openvpn/server.conf --daemon
+        # Generate client certificate if missing
+        [ ! -f ./pki/issued/client1.crt ] && ./easyrsa gen-req client1 nopass
+        [ ! -f ./pki/issued/client1.crt ] && ./easyrsa sign-req client client1
 
-      - name: Connect Tailscale
-        run: |
-          sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
+        # Generate Diffie-Hellman parameters if missing
+        [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
 
-      - name: Get Tailscale IP
-        run: |
-          tailscale ip -4 > ts_ip.txt
-          cat ts_ip.txt
-        id: get_ip
+    - name: Generate client.ovpn
+      run: |
+        EASYRSA_DIR=~/openvpn-ca/easy-rsa
+        cd $EASYRSA_DIR
 
-      - name: Upload client.ovpn
-        run: |
-          HOST=$(tailscale ip -4)
-          PORT=$OPENVPN_PORT
-          cat <<EOF > client.ovpn
-          client
-          dev tun
-          proto tcp
-          remote $HOST $PORT
-          resolv-retry infinite
-          nobind
-          persist-key
-          persist-tun
-          remote-cert-tls server
-          cipher AES-256-CBC
-          verb 3
-          <ca>
-          $(cat ~/openvpn-ca/pki/ca.crt)
-          </ca>
-          <cert>
-          $(cat ~/openvpn-ca/pki/issued/client1.crt)
-          </cert>
-          <key>
-          $(cat ~/openvpn-ca/pki/private/client1.key)
-          </key>
-          EOF
+        SERVER_IP=$(tailscale ip -4)  # Get GitHub Runner Tailscale IP
+        cat <<EOF > client.ovpn
+client
+dev tun
+proto tcp
+remote $SERVER_IP $OPENVPN_PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+verb 3
+<ca>
+$(cat pki/ca.crt)
+</ca>
+<cert>
+$(cat pki/issued/client1.crt)
+</cert>
+<key>
+$(cat pki/private/client1.key)
+</key>
+EOF
 
-      - name: Upload client.ovpn artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: client-ovpn
-          path: client.ovpn
+    - name: Upload client.ovpn
+      uses: actions/upload-artifact@v4
+      with:
+        name: client-ovpn
+        path: ~/openvpn-ca/easy-rsa/client.ovpn
