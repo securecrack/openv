@@ -35,7 +35,7 @@ jobs:
 
       - name: Configure Firewall
         run: |
-          sudo ufw allow $OPENVPN_PORT/tcp
+          sudo ufw allow ${OPENVPN_PORT}/tcp
           sudo ufw enable || true
 
       - name: Setup Easy-RSA for OpenVPN
@@ -60,7 +60,7 @@ jobs:
           cd $OPENVPN_DIR
           SERVER_IP=$(tailscale ip -4)
           cat > server.conf <<EOF
-port $OPENVPN_PORT
+port ${OPENVPN_PORT}
 proto tcp
 dev tun
 ca pki/ca.crt
@@ -93,7 +93,7 @@ EOF
 client
 dev tun
 proto tcp
-remote $SERVER_IP $OPENVPN_PORT
+remote ${SERVER_IP} ${OPENVPN_PORT}
 resolv-retry infinite
 nobind
 persist-key
