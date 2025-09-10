@@ -1,87 +1,85 @@
-name: Auto Tailscale OpenVPN
+name: FreeVPS-OpenVPN-Tailscale
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # manual trigger
   schedule:
-    - cron: "0 */6 * * *"  # runs every 6 hours to re-init the VPN automatically
+    - cron: "0 */6 * * *"   # every 6 hours
 
 jobs:
-  vpn:
+  build:
     runs-on: ubuntu-latest
-    steps:
+    env:
+      TS_CLIENT_ID: ${{ secrets.TS_CLIENT_ID }}
+      TS_CLIENT_SECRET: ${{ secrets.TS_CLIENT_SECRET }}
+      OPENVPN_PORT: 1194
 
-      # 1️⃣ Update system and install dependencies
-      - name: Update & Install Packages
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
         run: |
           sudo apt update && sudo apt upgrade -y
-          sudo apt install openvpn easy-rsa iproute2 curl jq -y
+          sudo apt install -y openvpn easy-rsa jq curl unzip
 
-      # 2️⃣ Install Tailscale
       - name: Install Tailscale
-        run: curl -fsSL https://tailscale.com/install.sh | sh
-
-      # 3️⃣ Connect Tailscale with auth key
-      - name: Connect Tailscale
-        env:
-          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
         run: |
-          sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
+          curl -fsSL https://tailscale.com/install.sh | sh
 
-      # 4️⃣ Setup OpenVPN PKI
-      - name: Setup OpenVPN PKI
+      - name: Start Tailscale
         run: |
-          mkdir -p ~/openvpn-ca
+          sudo tailscale up \
+            --oauth-client-id $TS_CLIENT_ID \
+            --oauth-client-secret $TS_CLIENT_SECRET \
+            --hostname github-runner \
+            --accept-routes
+
+      - name: Setup Easy-RSA and generate CA
+        run: |
+          make-cadir ~/openvpn-ca
           cd ~/openvpn-ca
-          if [ ! -d pki ]; then
-            ./easyrsa init-pki
-            echo | ./easyrsa build-ca nopass
-            ./easyrsa gen-req server nopass
-            ./easyrsa sign-req server server
-            ./easyrsa gen-dh
-            openvpn --genkey --secret ta.key
-            ./easyrsa gen-req client1 nopass
-            ./easyrsa sign-req client client1
-          fi
+          ./easyrsa init-pki
+          echo -en "\n" | ./easyrsa build-ca nopass
+          ./easyrsa gen-req server nopass
+          ./easyrsa sign-req server server
+          ./easyrsa gen-req client1 nopass
+          ./easyrsa sign-req client client1
+          ./easyrsa gen-dh
 
-      # 5️⃣ Configure OpenVPN server
-      - name: Configure OpenVPN
+      - name: Configure OpenVPN server
         run: |
-          sudo bash -c 'cat > /etc/openvpn/server.conf <<EOF
-          port 1194
-          proto udp
+          sudo cp ~/openvpn-ca/pki/ca.crt /etc/openvpn/
+          sudo cp ~/openvpn-ca/pki/issued/server.crt /etc/openvpn/
+          sudo cp ~/openvpn-ca/pki/private/server.key /etc/openvpn/
+          sudo cp ~/openvpn-ca/pki/dh.pem /etc/openvpn/dh2048.pem
+
+          cat <<EOF | sudo tee /etc/openvpn/server.conf
+          port $OPENVPN_PORT
+          proto tcp
           dev tun
-          ca ~/openvpn-ca/pki/ca.crt
-          cert ~/openvpn-ca/pki/issued/server.crt
-          key ~/openvpn-ca/pki/private/server.key
-          dh ~/openvpn-ca/pki/dh.pem
+          ca /etc/openvpn/ca.crt
+          cert /etc/openvpn/server.crt
+          key /etc/openvpn/server.key
+          dh /etc/openvpn/dh2048.pem
           server 10.8.0.0 255.255.255.0
-          ifconfig-pool-persist ipp.txt
           keepalive 10 120
-          cipher AES-256-CBC
           persist-key
           persist-tun
-          status openvpn-status.log
+          status /var/log/openvpn-status.log
           verb 3
-          tls-auth ~/openvpn-ca/ta.key 0
-          EOF'
+          EOF
 
-      # 6️⃣ Start OpenVPN in background with retry
-      - name: Start OpenVPN
-        run: |
-          sudo pkill openvpn || true
-          nohup sudo openvpn --config /etc/openvpn/server.conf & sleep 5
+      - name: Start OpenVPN server
+        run: sudo openvpn --config /etc/openvpn/server.conf --daemon
 
-      # 7️⃣ Generate client config dynamically using Tailscale IP
       - name: Generate client.ovpn
         run: |
-          HOST=$(tailscale ip -4)
-          PORT=1194
-          mkdir -p ~/client-config
-          cat <<EOF > ~/client-config/client.ovpn
+          TAILSCALE_IP=$(tailscale ip -4)
+          cat <<EOF > client.ovpn
           client
           dev tun
-          proto udp
-          remote $HOST $PORT
+          proto tcp
+          remote $TAILSCALE_IP $OPENVPN_PORT
           resolv-retry infinite
           nobind
           persist-key
@@ -100,10 +98,8 @@ jobs:
           </key>
           EOF
 
-      # 8️⃣ Upload client.ovpn as artifact for download
-      - name: Upload client.ovpn
+      - name: Upload OpenVPN client config
         uses: actions/upload-artifact@v4
         with:
           name: client-ovpn
-          path: ~/client-config/client.ovpn
-          if-no-files-found: warn
+          path: client.ovpn
