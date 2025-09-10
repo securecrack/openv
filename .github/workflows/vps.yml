@@ -29,8 +29,9 @@ jobs:
 
     - name: Setup Easy-RSA
       run: |
-        mkdir -p ~/openvpn-ca
-        cd ~/openvpn-ca
+        OPENVPN_DIR=$HOME/openvpn-ca
+        mkdir -p $OPENVPN_DIR
+        cd $OPENVPN_DIR
         # Initialize Easy-RSA if missing
         [ ! -d ./easy-rsa ] && make-cadir ./easy-rsa
         cd easy-rsa
@@ -47,12 +48,42 @@ jobs:
         # Generate Diffie-Hellman parameters if missing
         [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
 
+    - name: Generate server.conf
+      run: |
+        OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
+        cd $OPENVPN_DIR
+        SERVER_IP=$(tailscale ip -4)
+        cat > server.conf <<EOF
+port $OPENVPN_PORT
+proto tcp
+dev tun
+ca pki/ca.crt
+cert pki/issued/server.crt
+key pki/private/server.key
+dh pki/dh.pem
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist ipp.txt
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 8.8.8.8"
+keepalive 10 120
+cipher AES-256-CBC
+persist-key
+persist-tun
+status openvpn-status.log
+verb 3
+EOF
+
+    - name: Start OpenVPN server
+      run: |
+        OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
+        sudo openvpn --config $OPENVPN_DIR/server.conf &
+
     - name: Generate client.ovpn
       run: |
-        EASYRSA_DIR=~/openvpn-ca/easy-rsa
-        cd $EASYRSA_DIR
+        OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
+        cd $OPENVPN_DIR
         SERVER_IP=$(tailscale ip -4)
-        cat <<'EOF' > client.ovpn
+        cat > client.ovpn <<EOF
 client
 dev tun
 proto tcp
@@ -79,4 +110,4 @@ EOF
       uses: actions/upload-artifact@v4
       with:
         name: client-ovpn
-        path: ~/openvpn-ca/easy-rsa/client.ovpn
+        path: $HOME/openvpn-ca/easy-rsa/client.ovpn
