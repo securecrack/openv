@@ -11,7 +11,7 @@ jobs:
       TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
 
     steps:
-    - name: Checkout repo
+    - name: Checkout repository
       uses: actions/checkout@v3
 
     - name: Install dependencies
@@ -31,28 +31,19 @@ jobs:
       run: |
         mkdir -p ~/openvpn-ca
         cd ~/openvpn-ca
-
         # Initialize Easy-RSA if missing
-        if [ ! -d ./easy-rsa ]; then
-            make-cadir ./easy-rsa
-        fi
-
+        [ ! -d ./easy-rsa ] && make-cadir ./easy-rsa
         cd easy-rsa
-
         # Initialize PKI if missing
         [ ! -d ./pki ] && ./easyrsa init-pki
-
         # Build CA if missing
         [ ! -f ./pki/ca.crt ] && (export EASYRSA_BATCH=1; export EASYRSA_REQ_CN="github-runner"; ./easyrsa build-ca nopass)
-
         # Generate server certificate if missing
         [ ! -f ./pki/issued/server.crt ] && ./easyrsa gen-req server nopass
         [ ! -f ./pki/issued/server.crt ] && ./easyrsa sign-req server server
-
         # Generate client certificate if missing
         [ ! -f ./pki/issued/client1.crt ] && ./easyrsa gen-req client1 nopass
         [ ! -f ./pki/issued/client1.crt ] && ./easyrsa sign-req client client1
-
         # Generate Diffie-Hellman parameters if missing
         [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
 
@@ -60,9 +51,8 @@ jobs:
       run: |
         EASYRSA_DIR=~/openvpn-ca/easy-rsa
         cd $EASYRSA_DIR
-
-        SERVER_IP=$(tailscale ip -4)  # Get GitHub Runner Tailscale IP
-        cat <<EOF > client.ovpn
+        SERVER_IP=$(tailscale ip -4)
+        cat <<'EOF' > client.ovpn
 client
 dev tun
 proto tcp
