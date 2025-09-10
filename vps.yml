@@ -1,113 +1,92 @@
-name: OpenVPN Server
+name: OpenVPN + Tailscale Setup
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  setup-openvpn:
     runs-on: ubuntu-latest
+    env:
+      OPENVPN_PORT: 1194
+      TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+    - name: Checkout repo
+      uses: actions/checkout@v3
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openvpn easy-rsa wget unzip jq
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openvpn easy-rsa ufw curl jq
 
-      - name: Setup EasyRSA PKI
-        run: |
-          make-cadir ~/openvpn-ca
-          cd ~/openvpn-ca
-          ./easyrsa init-pki
-          ./easyrsa --batch build-ca nopass
-          ./easyrsa gen-dh
-          ./easyrsa --batch gen-req server nopass
-          ./easyrsa --batch sign-req server server
-          ./easyrsa --batch gen-req client1 nopass
-          ./easyrsa --batch sign-req client client1
+    - name: Install Tailscale
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Configure OpenVPN Server
-        run: |
-          sudo mkdir -p /etc/openvpn
-          sudo cp ~/openvpn-ca/pki/ca.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/private/server.key /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/issued/server.crt /etc/openvpn/
-          sudo cp ~/openvpn-ca/pki/dh.pem /etc/openvpn/
-          cat <<EOF | sudo tee /etc/openvpn/server.conf
-          port 1194
-          proto tcp
-          dev tun
-          ca ca.crt
-          cert server.crt
-          key server.key
-          dh dh.pem
-          keepalive 10 120
-          persist-key
-          persist-tun
-          status openvpn-status.log
-          verb 3
-          EOF
+    - name: Connect Tailscale
+      run: |
+        sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
 
-      - name: Start OpenVPN
-        run: |
-          nohup sudo openvpn --config /etc/openvpn/server.conf > openvpn.log 2>&1 &
-          sleep 10
-          tail -n 20 openvpn.log
+    - name: Setup Easy-RSA
+      run: |
+        mkdir -p ~/openvpn-ca
+        cd ~/openvpn-ca
 
-      - name: Install ngrok
-        run: |
-          wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip
-          unzip ngrok-stable-linux-amd64.zip
-          sudo mv ngrok /usr/local/bin
+        # Initialize Easy-RSA if missing
+        if [ ! -d ./easy-rsa ]; then
+            make-cadir ./easy-rsa
+        fi
 
-      - name: Authenticate ngrok
-        run: |
-          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+        cd easy-rsa
 
-      - name: Start ngrok tunnel
-        run: |
-          nohup ngrok tcp 1194 > ngrok.log &
-          sleep 10
-          cat ngrok.log
+        # Initialize PKI if missing
+        [ ! -d ./pki ] && ./easyrsa init-pki
 
-      - name: Get ngrok public address
-        run: |
-          curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' > ngrok_url.txt
-          cat ngrok_url.txt
+        # Build CA if missing
+        [ ! -f ./pki/ca.crt ] && (export EASYRSA_BATCH=1; export EASYRSA_REQ_CN="github-runner"; ./easyrsa build-ca nopass)
 
-      - name: Generate Client OVPN Profile
-        run: |
-          NGROK_ADDR=$(cat ngrok_url.txt | sed 's/tcp:\/\///')
-          HOST=$(echo $NGROK_ADDR | cut -d: -f1)
-          PORT=$(echo $NGROK_ADDR | cut -d: -f2)
+        # Generate server certificate if missing
+        [ ! -f ./pki/issued/server.crt ] && ./easyrsa gen-req server nopass
+        [ ! -f ./pki/issued/server.crt ] && ./easyrsa sign-req server server
 
-          cat <<EOF > client.ovpn
-          client
-          dev tun
-          proto tcp
-          remote $HOST $PORT
-          resolv-retry infinite
-          nobind
-          persist-key
-          persist-tun
-          remote-cert-tls server
-          cipher AES-256-CBC
-          verb 3
-          <ca>
-          $(cat ~/openvpn-ca/pki/ca.crt)
-          </ca>
-          <cert>
-          $(cat ~/openvpn-ca/pki/issued/client1.crt)
-          </cert>
-          <key>
-          $(cat ~/openvpn-ca/pki/private/client1.key)
-          </key>
-          EOF
+        # Generate client certificate if missing
+        [ ! -f ./pki/issued/client1.crt ] && ./easyrsa gen-req client1 nopass
+        [ ! -f ./pki/issued/client1.crt ] && ./easyrsa sign-req client client1
 
-      - name: Upload OVPN Config
-        uses: actions/upload-artifact@v4
-        with:
-          name: client-ovpn
-          path: client.ovpn
+        # Generate Diffie-Hellman parameters if missing
+        [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
+
+    - name: Generate client.ovpn
+      run: |
+        EASYRSA_DIR=~/openvpn-ca/easy-rsa
+        cd $EASYRSA_DIR
+
+        SERVER_IP=$(tailscale ip -4)  # Get GitHub Runner Tailscale IP
+        cat <<EOF > client.ovpn
+client
+dev tun
+proto tcp
+remote $SERVER_IP $OPENVPN_PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+verb 3
+<ca>
+$(cat pki/ca.crt)
+</ca>
+<cert>
+$(cat pki/issued/client1.crt)
+</cert>
+<key>
+$(cat pki/private/client1.key)
+</key>
+EOF
+
+    - name: Upload client.ovpn
+      uses: actions/upload-artifact@v4
+      with:
+        name: client-ovpn
+        path: ~/openvpn-ca/easy-rsa/client.ovpn
