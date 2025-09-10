@@ -11,7 +11,7 @@ jobs:
       TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
 
     steps:
-    - name: Checkout repository
+    - name: Checkout repo
       uses: actions/checkout@v3
 
     - name: Install dependencies
@@ -29,11 +29,12 @@ jobs:
 
     - name: Setup Easy-RSA
       run: |
-        OPENVPN_DIR=$HOME/openvpn-ca
-        mkdir -p $OPENVPN_DIR
-        cd $OPENVPN_DIR
+        mkdir -p ~/openvpn-ca
+        cd ~/openvpn-ca
         # Initialize Easy-RSA if missing
-        [ ! -d ./easy-rsa ] && make-cadir ./easy-rsa
+        if [ ! -d ./easy-rsa ]; then
+            make-cadir ./easy-rsa
+        fi
         cd easy-rsa
         # Initialize PKI if missing
         [ ! -d ./pki ] && ./easyrsa init-pki
@@ -73,11 +74,6 @@ status openvpn-status.log
 verb 3
 EOF
 
-    - name: Start OpenVPN server
-      run: |
-        OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
-        sudo openvpn --config $OPENVPN_DIR/server.conf &
-
     - name: Generate client.ovpn
       run: |
         OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
@@ -110,4 +106,4 @@ EOF
       uses: actions/upload-artifact@v4
       with:
         name: client-ovpn
-        path: $HOME/openvpn-ca/easy-rsa/client.ovpn
+        path: ~/openvpn-ca/easy-rsa/client.ovpn
