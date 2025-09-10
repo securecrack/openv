@@ -1,60 +1,65 @@
-name: OpenVPN + Tailscale Setup
+name: Persistent Tailscale + OpenVPN Setup
 
 on:
   workflow_dispatch:
 
 jobs:
-  setup-openvpn:
-    runs-on: ubuntu-latest
+  setup-vpn:
+    # Must run on your self-hosted runner
+    runs-on: self-hosted
     env:
       OPENVPN_PORT: 1194
       TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y openvpn easy-rsa ufw curl jq
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn easy-rsa ufw curl jq
 
-    - name: Install Tailscale
-      run: |
-        curl -fsSL https://tailscale.com/install.sh | sh
+      - name: Install Tailscale
+        run: |
+          if ! command -v tailscale &> /dev/null; then
+            curl -fsSL https://tailscale.com/install.sh | sh
+          fi
+          sudo systemctl enable --now tailscaled
 
-    - name: Connect Tailscale
-      run: |
-        sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --accept-routes
+      - name: Connect Tailscale and Advertise Exit Node
+        run: |
+          sudo tailscale up --authkey $TS_AUTH_KEY --hostname github-runner --advertise-exit-node --accept-routes
+          tailscale status
+          tailscale ip -4
 
-    - name: Setup Easy-RSA
-      run: |
-        mkdir -p ~/openvpn-ca
-        cd ~/openvpn-ca
-        # Initialize Easy-RSA if missing
-        if [ ! -d ./easy-rsa ]; then
+      - name: Configure Firewall
+        run: |
+          sudo ufw allow $OPENVPN_PORT/tcp
+          sudo ufw enable || true
+
+      - name: Setup Easy-RSA for OpenVPN
+        run: |
+          mkdir -p ~/openvpn-ca
+          cd ~/openvpn-ca
+          if [ ! -d ./easy-rsa ]; then
             make-cadir ./easy-rsa
-        fi
-        cd easy-rsa
-        # Initialize PKI if missing
-        [ ! -d ./pki ] && ./easyrsa init-pki
-        # Build CA if missing
-        [ ! -f ./pki/ca.crt ] && (export EASYRSA_BATCH=1; export EASYRSA_REQ_CN="github-runner"; ./easyrsa build-ca nopass)
-        # Generate server certificate if missing
-        [ ! -f ./pki/issued/server.crt ] && ./easyrsa gen-req server nopass
-        [ ! -f ./pki/issued/server.crt ] && ./easyrsa sign-req server server
-        # Generate client certificate if missing
-        [ ! -f ./pki/issued/client1.crt ] && ./easyrsa gen-req client1 nopass
-        [ ! -f ./pki/issued/client1.crt ] && ./easyrsa sign-req client client1
-        # Generate Diffie-Hellman parameters if missing
-        [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
+          fi
+          cd easy-rsa
+          [ ! -d ./pki ] && ./easyrsa init-pki
+          [ ! -f ./pki/ca.crt ] && (export EASYRSA_BATCH=1; export EASYRSA_REQ_CN="github-runner"; ./easyrsa build-ca nopass)
+          [ ! -f ./pki/issued/server.crt ] && ./easyrsa gen-req server nopass
+          [ ! -f ./pki/issued/server.crt ] && ./easyrsa sign-req server server
+          [ ! -f ./pki/issued/client1.crt ] && ./easyrsa gen-req client1 nopass
+          [ ! -f ./pki/issued/client1.crt ] && ./easyrsa sign-req client client1
+          [ ! -f ./pki/dh.pem ] && ./easyrsa gen-dh
 
-    - name: Generate server.conf
-      run: |
-        OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
-        cd $OPENVPN_DIR
-        SERVER_IP=$(tailscale ip -4)
-        cat > server.conf <<EOF
+      - name: Generate OpenVPN Server Config
+        run: |
+          OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
+          cd $OPENVPN_DIR
+          SERVER_IP=$(tailscale ip -4)
+          cat > server.conf <<EOF
 port $OPENVPN_PORT
 proto tcp
 dev tun
@@ -74,12 +79,17 @@ status openvpn-status.log
 verb 3
 EOF
 
-    - name: Generate client.ovpn
-      run: |
-        OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
-        cd $OPENVPN_DIR
-        SERVER_IP=$(tailscale ip -4)
-        cat > client.ovpn <<EOF
+      - name: Enable OpenVPN Service
+        run: |
+          sudo cp $HOME/openvpn-ca/easy-rsa/server.conf /etc/openvpn/server.conf
+          sudo systemctl enable --now openvpn@server
+
+      - name: Generate OpenVPN Client Config
+        run: |
+          OPENVPN_DIR=$HOME/openvpn-ca/easy-rsa
+          cd $OPENVPN_DIR
+          SERVER_IP=$(tailscale ip -4)
+          cat > client.ovpn <<EOF
 client
 dev tun
 proto tcp
@@ -102,8 +112,8 @@ $(cat pki/private/client1.key)
 </key>
 EOF
 
-    - name: Upload client.ovpn
-      uses: actions/upload-artifact@v4
-      with:
-        name: client-ovpn
-        path: ~/openvpn-ca/easy-rsa/client.ovpn
+      - name: Upload Client Config
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-ovpn
+          path: ~/openvpn-ca/easy-rsa/client.ovpn
